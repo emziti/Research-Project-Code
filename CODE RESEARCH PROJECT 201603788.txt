@@ -1,0 +1,463 @@
+
+
+
+
+# IMPORTS
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.integrate import solve_ivp
+from scipy import stats
+
+import warnings
+
+from scipy import optimize
+from scipy.optimize import brentq, newton
+
+# set these constants to incluse the effects of: 
+# ICU facilities becoming overwhelmed
+ICU_OVERWHELM = True
+# R_t being modified due to number of deaths:
+DEATH_REACTIVE_R_T = True
+
+# Susceptible
+def dS_dt(S, I, R_t, t_inf):
+    return -(R_t / t_inf) * I * S
+
+# Exposed
+def dE_dt(S, E, I, R_t, t_inf, t_inc):
+    return (R_t / t_inf) * I * S - (E / t_inc)
+
+# Infected
+def dI_dt(I, E, t_inc, t_inf):
+    return (E / t_inc) - (I / t_inf)
+
+# Hospitalized 
+def dH_dt(I, C, H, t_inf, t_hosp, t_crit, frac_mild_total, frac_fatal):
+    return ((1 - frac_mild_total) * (I / t_inf)) + ((1 - frac_fatal) * C / t_crit) - (H / t_hosp)
+
+# Critical
+def dC_dt(H, C, t_hosp, t_crit, frac_crit):
+    return (frac_crit * H / t_hosp) - (C/t_crit)
+    # return (frac_crit * H / t_hosp) - (1-frac_fatal)*(C/t_crit) - frac_fatal*(C/t_crit)
+    # i.e.  = (term gained from Hospitalised) - (term lost to Hospitalised) - (term lost to Deaths)
+    #       = (term gained from H) - (terms lost to both H and D)
+
+# Recovered
+def dR_dt(I, H, t_inf, t_hosp, frac_mild_total, frac_crit):
+    return (frac_mild_total * I / t_inf) + (1 - frac_crit) * (H / t_hosp)
+
+# Deaths
+def dD_dt(C, t_crit, frac_fatal):
+    return frac_fatal * (C/t_crit)
+
+# this function is a saturating look-up table
+def find_idx_nearest(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return idx # array[idx], idx
+
+def SEIR_HCD_model(t, y, R_t, t_inc=2.9, t_inf=6.1, t_hosp=4, t_crit=10, frac_mild_total=0.96, frac_crit=0.2, frac_fatal=0.2):
+    """
+    :param t: Time step for solve_ivp
+    :param y: Previous solution or initial values
+    :param R_t: Time-varying reproductive number
+    :param t_inc: Average incubation period. 
+    :param t_inf: Average infectious period. 
+    :param t_hosp: Average time a patient is in hospital before either recovering or becoming critical.
+    :param t_crit: Average time a patient is in a critical state (either recovers or dies).
+    :param frac_mild_total: Fraction of infections that are asymptomatic or mild.      
+    :param frac_crit: Fraction of severe cases that turn critical.                      
+    :param frac_fatal: Fraction of critical cases that are fatal.                   
+    :return:
+    """
+    
+    # Evaluate R_t if it is a function, otherwise use it as is
+    if callable(R_t):
+        reprod = R_t(t)
+    else:
+        reprod = R_t
+
+    S, E, I, R, H, C, D = y
+
+
+    # Account for ICU overload by modifying the fatality ratio
+    if ICU_OVERWHELM:
+      ICU_CAPACITY = 40/N # 
+      if C > ICU_CAPACITY:
+        frac_fatal = (ICU_CAPACITY/C)*frac_fatal + ((C - ICU_CAPACITY)/C)*np.minimum(0.95, np.random.normal(0.75, 0.10))
+        #frac_fatal =  (patients needing ICU who can get it)*(regular fatality rate) + (patients needing ICU who can't get it)*(higher fatality rate)
+    
+    if DEATH_REACTIVE_R_T:
+      # account for effect of increased deaths in a society: 
+      #   i. extra lockdown by goverment in response to more deaths 
+      #   ii. greater compliance with social distancing measures
+      # by having a cap/limit for R_t, depending on the number of deaths
+      
+      dn = np.linspace(1e+02, 5e+04, 100)
+      rn = np.linspace(3, 1.2, 100)
+      rtcap = rn[find_idx_nearest(dn, D*N)] 
+      reprod = np.minimum(rtcap, reprod)
+
+    S_out = dS_dt(S, I, reprod, t_inf)
+    E_out = dE_dt(S, E, I, reprod, t_inf, t_inc)
+    I_out = dI_dt(I, E, t_inc, t_inf)
+    R_out = dR_dt(I, H, t_inf, t_hosp, frac_mild_total, frac_crit)
+    H_out = dH_dt(I, C, H, t_inf, t_hosp, t_crit, frac_mild_total, frac_fatal)
+    C_out = dC_dt(H, C, t_hosp, t_crit, frac_crit)
+    D_out = dD_dt(C, t_crit, frac_fatal)
+    return [S_out, E_out, I_out, R_out, H_out, C_out, D_out]
+
+
+
+def plot_ensemble(N, scenarios, alpha_val, title='SARAO SEIR-HCD Model'):
+    # set up the axes, titles, styles, etc
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16,12))
+    fig.suptitle(title, fontsize=16)
+    ax1.set_title("Individuals in Critical State")
+    ax2.set_title("Fatalities")
+    ax3.set_title("Individuals in Hospital")
+    ax4.set_title(("Cumulative Total Cases"))
+    #ax4.set_title(("Current Total Cases"))
+    
+    ax3.set_xlabel("Days", fontsize=15);
+    ax4.set_xlabel("Days", fontsize=15);
+    
+    # set uniform characteristics for axes
+    for idx, axis in enumerate([ax1, ax2, ax3, ax4]):
+        axis.set_ylim(ymin=6, ymax=N*1.2)
+        axis.set_xlim(0, model_days)
+        axis.set_yscale('log')
+        axis.tick_params(axis='y', labelsize=15);
+        axis.tick_params(axis='x', labelsize=15);
+        axis.hlines([1e+03, 1e+04, 1e+05, 1e+06], xmin=0, xmax=model_days, linestyles='dotted', alpha = 0.6);
+    
+    # loop over each scenario in the ensemble and plot to the axes
+    median_death_list = []
+    median_hosp_list = []
+    median_critical_list = []
+    median_cases_list = []
+
+    for idx, solution in enumerate(scenarios):
+        sus, exp, inf, rec, hosp, crit, death = solution.y
+        cases = (inf + rec + hosp + crit + death)
+        ax1.plot(crit*N, 'tab:orange', label='Critical', alpha=alpha_val);
+        ax2.plot(death*N, 'red', label='Fatalities', alpha=alpha_val);
+        ax3.plot(hosp*N, 'dodgerblue', label='Hospitalised', alpha=alpha_val);
+        ax4.plot(cases*N, 'tab:blue', label='All cases', alpha=alpha_val);
+        
+        median_death_list.append(scenarios[idx].y[6])
+        median_hosp_list.append(scenarios[idx].y[4])
+        median_critical_list.append(scenarios[idx].y[5])
+        median_cases_list.append(scenarios[idx].y[2]+scenarios[idx].y[3]+scenarios[idx].y[4]+scenarios[idx].y[5]++scenarios[idx].y[6])
+    
+    median_curve_deaths = np.median(median_death_list,axis = 0)
+    median_curve_cases = np.median(median_cases_list,axis = 0)
+
+    ax2.plot(median_curve_deaths*N, color = 'white', linewidth = '2') #, label='Fatalities', alpha=alpha_val);
+    ax4.plot(median_curve_cases*N, color = 'white', linewidth = '2') #, label='Fatalities', alpha=alpha_val);
+
+
+    #plot measured cases and deaths from Worldometer
+    dates = np.array(["Feb 15","Feb 16","Feb 17","Feb 18","Feb 19","Feb 20","Feb 21","Feb 22","Feb 23","Feb 24","Feb 25","Feb 26","Feb 27","Feb 28","Feb 29","Mar 01","Mar 02","Mar 03","Mar 04","Mar 05","Mar 06","Mar 07","Mar 08","Mar 09","Mar 10","Mar 11","Mar 12","Mar 13","Mar 14","Mar 15","Mar 16","Mar 17","Mar 18","Mar 19","Mar 20","Mar 21","Mar 22","Mar 23","Mar 24","Mar 25","Mar 26","Mar 27","Mar 28","Mar 29","Mar 30","Mar 31","Apr 01","Apr 02","Apr 03","Apr 04","Apr 05","Apr 06","Apr 07","Apr 08","Apr 09","Apr 10","Apr 11","Apr 12","Apr 13","Apr 14","Apr 15","Apr 16","Apr 17","Apr 18","Apr 19","Apr 20","Apr 21","Apr 22","Apr 23","Apr 24","Apr 25","Apr 26","Apr 27","Apr 28","Apr 29","Apr 30","May 01","May 02","May 03","May 04","May 05","May 06","May 07","May 08","May 09","May 10","May 11","May 12","May 13","May 14","May 15","May 16","May 17","May 18","May 19","May 20","May 21","May 22","May 23","May 24","May 25","May 26","May 27","May 28","May 29","May 30","May 31","Jun 01","Jun 02","Jun 03","Jun 04","Jun 05","Jun 06"])
+    deaths = np.array([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,2,3,5,5,5,9,9,11,12,13,18,18,24,25,25,27,27,34,48,50,52,54,58,58,65,75,79,86,87,90,93,103,103,116,123,131,138,148,153,161,178,186,194,206,206,219,238,247,261,264,286,312,339,369,397,407,429,481,524,552,577,611,643,683,705,755,792, 848, 908, 952])
+    ax2.semilogy(deaths[46:], color = 'k', linewidth = '3')  # Plot from 1 April
+
+
+
+  ((ax1, ax2), (ax3, ax4)) = axes
+  fig.suptitle(title, fontsize=14)
+  #ax1.set_title("Day: " + str(days[0]))
+  #ax2.set_title("Day: " + str(days[1]))
+  #ax3.set_title("Day: " + str(days[2]))
+  #ax4.set_title("Maximum")
+  ax1.set_title("20 August")
+  ax2.set_title("20 September")
+  ax3.set_title("20 October")
+  ax4.set_title("Maximum")
+  plt.tight_layout()
+
+  # set uniform characteristics for axes
+  for idx, axis in enumerate([ax1, ax2, ax3, ax4]):
+    #print(idx, axis)
+    axis.set_yscale('log')
+    axis.set_xscale("log")
+    axis.tick_params(axis='y', labelsize=12);
+
+    if idx == 3:
+      hist_data = N*comp.max(1)
+    else:
+      hist_data = N*comp[:,int(days[idx])]
+    
+    ax1.set_ylabel("density", fontsize=10);
+        
+    MAX=np.max(hist_data)
+    MIN=np.min(hist_data)
+    bins = np.logspace(np.log10(MIN), np.log10(MAX), 30)
+    x_d = np.linspace(MIN, MAX, hist_data.shape[0])
+
+    axis.hist(hist_data, bins=bins, density=True, histtype='step', linewidth = '2', color=colour_to_use)#, alpha=0.5, log=True)
+
+    #percentiles
+    axis.axvline(np.percentile(hist_data, 50), color='red', linewidth = '2', linestyle='solid', alpha=0.85) #ax2.axvline(np.median(h_data), color='g')
+    #axis.axvline(np.percentile(hist_data, 84), color='blue', linestyle='dashed', alpha=0.5)
+    #axis.axvline(np.percentile(hist_data, 16), color='red', linestyle='dashed', alpha=0.5)
+    axis.axvline(np.percentile(hist_data, 97.5), color='blue', linestyle='dashed', alpha=0.75)
+    axis.axvline(np.percentile(hist_data, 2.5), color='blue', linestyle='dashed', alpha=0.75)
+
+
+
+# Reported values for Namibia as of 20 August 2020
+
+N = 2540905  # Population size
+n_tested_active =  2429
+n_total_cases = 4912
+n_hosp = 23 
+n_crit = 6 
+n_dead = 41
+
+
+
+
+def time_varying_reproduction(t):
+  if t <= t_1:
+    # throw warning that default value of R_0 is being used
+    warnings.warn("Using lower default R_0 in time-varying_reproduction function") 
+    return R_0
+  elif t > t_1 and t <= t_2:
+    return R_t_1
+  elif t > t_2 and t <= t_3:
+    return R_t_2
+  elif t > t_3 and t <= t_4:
+    return R_t_3
+  elif t > t_4 and t <= t_5:
+    return R_t_4
+  elif t > t_5:
+    return R_t_5
+  else:
+    warnings.warn("Using upper default R_0 in time-varying_reproduction function")
+    return R_0
+
+ENSEMBLES
+
+model_days = 365  
+N_RUNS = 2000
+t_arr = np.empty((N_RUNS, model_days))
+low_dead = 0
+i_scenarios = []
+ifr_list = []
+R_0_list = []
+attack_list = []
+ifr_max = 10
+ifr_min = 0.0
+
+for i in range(N_RUNS):
+  if i%200 == 199: 
+    print('Reached run: ', i+1)
+
+  # 'Scenario' parameters: draw from distributions of plausible values for R_t as well as the dates on which interventions will be enacted
+  
+  R_t_1 = np.maximum(1.25,np.random.normal(1.35, 0.15))
+  R_t_2 = np.maximum(0.85, R_t_1*np.random.normal(1.20, 0.15))
+  R_t_3 = np.maximum(0.65, R_t_2*np.random.normal(1.00, 0.20))
+  R_t_4 = np.maximum(0.65, R_t_3*np.random.normal(1.00, 0.20))
+  R_t_5 = np.maximum(0.65, R_t_4*np.random.normal(0.85, 0.30))
+
+  t_1 = -1
+  t_2 = int(np.maximum(31, np.random.normal(60, 7)))
+  t_3 = int(np.maximum(61, np.random.normal(90, 7)))
+  t_4 = int(np.random.normal(150, 21))
+  t_5 = int(np.random.normal(183, 28))
+
+  # Epidemiological parameters
+  R_0 = np.random.normal(2.3, 0.37)
+  t_incu = np.random.normal(8.53, 0.325) # average incubation period: "median incubation period was estimated to be 5.1 days (95% CI, 4.5 to 5.8 days) https://www.acpjournals.org/doi/10.7326/M20-0504
+  # "The mean incubation period was 5.2 days (95% confidence interval [CI], 4.1 to 7.0), with the 95th percentile of the distribution at 12.5 days." https://www.nejm.org/doi/full/10.1056/NEJMoa2001316
+  t_infect = np.maximum(2, np.random.normal(7.3, 1.15)) # average infectious period  https://www.thelancet.com/journals/laninf/article/PIIS1473-3099(20)30196-1/fulltext  # also see https://theconversation.com/how-long-are-you-infectious-when-you-have-coronavirus-135295
+  # 2.3 days (95% CI, 0.8–3.0 days) before symptom onset and peaked at 0.7 days (95% CI, −0.2–2.0 days) before symptom onset (Fig. 1c). The estimated proportion of presymptomatic transmission (area under the curve) was 44% (95% CI, 25–69%). Infectiousness was estimated to decline quickly within 7 days. https://www.nature.com/articles/s41591-020-0869-5
+  t_hosp = np.maximum(3, np.random.normal(12.3, 6)) # time in hospital before transitioning to either critical or recovered https://www.imperial.ac.uk/media/imperial-college/medicine/sph/ide/gida-fellowships/Imperial-College-COVID19-NPI-modelling-16-03-2020.pdf
+  t_crit = np.maximum(3, np.random.normal(9, 4)) # average time patient is critical before transition to recovered or dead    https://www.imperial.ac.uk/media/imperial-college/medicine/sph/ide/gida-fellowships/Imperial-College-COVID19-NPI-modelling-16-03-2020.pdf
+
+  frac_asymptomatic = np.minimum(0.96, np.random.normal(0.56, 0.15)) #5-80% https://www.cebm.net/covid-19/covid-19-what-proportion-are-asymptomatic/
+  frac_tested_mild = np.minimum(0.96, np.random.normal(0.70, 0.05)) # ratio of tested infections that are mild. [CCDC]
+  frac_mild_total = 1-((1-frac_asymptomatic) * (1 - frac_tested_mild))
+
+  # e.g. https://www.thelancet.com/journals/laninf/article/PIIS1473-3099(20)30196-1/fulltext 
+  # https://www.medrxiv.org/content/10.1101/2020.04.23.20076042v1.full.pdf: 
+
+  frac_crit = np.maximum(0.17, np.random.normal(0.25, 0.1)) # fraction of severe cases that become critical
+  # Note: in our model, all those who die must go through the critical compartment first. Thus, frac_crit and frac_fatal might be larger than values read from hospital->ICU and ICU->death records. A reminder that Critical, Hospitalised, etc are states of being, and need not exactly align to the location of an individual. For instance, individuals may move through Hospitalised and Critical compartments before eventually dying, all while still at home. 
+  
+  frac_fatal = np.maximum(0.2, np.random.normal(0.20, 0.1))  
+  
+  n_infected = n_tested_active * (1/(1-frac_asymptomatic)) # true infections from known tested positive
+  n_exposed = n_infected * 1.7
+  n_recovered = (n_total_cases - n_tested_active) * (1/(1-frac_asymptomatic))
+
+  initial_state = [(N - n_infected)/N, n_exposed/N, n_infected/N, n_recovered/N, n_hosp/N, n_crit/N, n_dead/N] #S, E, I, R, H, C, D  
+  
+  # Model a variable immune fraction: 
+  # frac_immune = np.minimum(np.maximum(0.05, np.random.normal(0.2, 0.15)), 0.9)
+  # initial_state = [(1-frac_immune)*(N-n_infected)/N, n_exposed/N, n_infected/N, ((frac_immune)*(N-n_infected-n_recovered))/N, n_hosp/N, n_crit/N, n_dead/N]
+
+  args = (time_varying_reproduction, t_incu, t_infect, t_hosp, t_crit, frac_mild_total, frac_crit, frac_fatal)
+
+  # run solver and save to solution nparray
+  sol = solve_ivp(SEIR_HCD_model, [0, model_days], initial_state, args=args, t_eval=np.arange(model_days))
+  total_cases = sol.y[2][-1] + sol.y[3][-1] + sol.y[4][-1] + sol.y[5][-1] + sol.y[6][-1]  
+  ifr = 100*sol.y[6][-1]/total_cases 
+  old_sol = sol
+
+  if (ifr < ifr_max) & (ifr > ifr_min): 
+    i_scenarios.append(sol)
+    ifr_list.append(ifr)
+  else:
+    i_scenarios.append(old_sol)
+  
+  attack_list.append(sol.y[3][-1])
+  R_0_list.append(R_0)
+
+#########
+  dn = np.linspace(1e+02, 5e+04, 100)
+  rn = np.linspace(3, 1.2, 100)
+  t = np.empty(model_days)
+  for j in range(model_days):
+      rtcap = rn[find_idx_nearest(dn, sol.y[6][j]*N)] 
+      reprod = time_varying_reproduction(j)
+      reprod = np.minimum(rtcap, reprod)
+      t[j] = reprod
+
+  plt.plot(t, color='blue', alpha=0.045)
+  plt.ylabel("$R_t$", fontsize = 16)
+  plt.xlabel("Day (from 20 August 2020)", fontsize = 15)
+  plt.tick_params(axis='y', labelsize=15);
+  plt.tick_params(axis='x', labelsize=15);
+
+  t_arr[i,:] = t
+
+
+median = np.empty(model_days)
+mean_curve = np.empty(model_days)
+
+percentile_sig_l = np.empty(model_days)
+percentile_sig_h = np.empty(model_days)
+percentile_2sig_l = np.empty(model_days)
+percentile_2sig_h = np.empty(model_days)
+
+for day in range(t_arr.shape[1]):
+
+  median[day] = np.median(t_arr[:,day])
+  mean_curve[day] = np.mean(t_arr[:,day])
+  percentile_sig_l[day] = np.percentile(t_arr[:,day], 16)
+  percentile_sig_h[day] = np.percentile(t_arr[:,day], 84)
+  percentile_2sig_l[day] = np.percentile(t_arr[:,day], 2.5)
+  percentile_2sig_h[day] = np.percentile(t_arr[:,day], 97.5)
+
+plt.ylim(0.3, 2.8)
+plt.xlim(0, 365)
+
+plt.plot(range(model_days), percentile_sig_l, linewidth = 2, color='goldenrod', alpha=0.95)
+plt.plot(range(model_days), percentile_sig_h, linewidth = 2, color='goldenrod', alpha=0.95)
+plt.plot(range(model_days), percentile_2sig_l, color='k', alpha=0.85)
+plt.plot(range(model_days), percentile_2sig_h, color='k', alpha=0.85)
+plt.plot(range(model_days), mean_curve, linewidth = 2, color = 'white')
+plt.fill_between(range(model_days), percentile_sig_l, percentile_sig_h,  facecolor='goldenrod', alpha=0.5)
+
+fig = plt.gcf()
+fig.set_size_inches(12, 7)
+
+plot_ensemble(N, i_scenarios, 50/N_RUNS, title = "SARAO: SEIR-HCD model - Intervention Scenario Ensemble")
+
+
+
+
+# plot a few specific R_t curves to show some representative behaviour
+for i in range(25):
+  plt.plot(t_arr[np.random.randint(t_arr.shape[0]),:])#, color = 'blue', alpha=0.6 )
+
+fig = plt.gcf()
+
+plt.xlabel("Days (from 20 August 2020)", fontsize = 14)
+plt.ylabel("$R_t$", fontsize = 16)
+fig.set_size_inches(9, 6)
+
+
+HISTOGRAMS:
+
+
+is_arr = np.empty([N_RUNS, sol.y.shape[0], sol.y.shape[1]])
+colorvec = ['orange','red','dodgerblue','blue']
+
+for idx, sol in enumerate(i_scenarios):
+  is_arr[idx,:,:] = sol.y
+
+# days of evaluation should correspond to [1 June, 1 July, 1 September]
+eval_days = [61,91,153]
+
+compartment_labels = ['Susceptible', 'Exposed', 'Infectious', 'Recovered', 'Hospitalised', 'Critical', 'Deaths']
+show_labels = ['Infectious', 'Hospitalised', 'Critical', 'Deaths']
+
+
+for idx, scen in enumerate(np.rollaxis(is_arr[:,[compartment_labels.index(show_labels[0]), compartment_labels.index(show_labels[1]), compartment_labels.index(show_labels[2]), compartment_labels.index(show_labels[3])],:], 1)):    
+    colour_plot = 'k' #colorvec[idx-1]
+    plot_hist(scen, colour_plot, title = show_labels[idx], days=eval_days)
+
+# for reference: sus, exp, inf, rec, hosp, crit, death = solution.y
+# cases = (inf + rec + hosp + crit + death)
+
+
+
+
+plt.hist(ifr_list, bins = 30, density=True, histtype='step', linewidth = '3', color='red')
+
+fig = plt.gcf()
+plt.xlabel('Infection Fatality Rate (Percent)', fontsize=12)
+# IFR estimate for China of 0.66% (0.39%-1.33%) https://www.medrxiv.org/content/10.1101/2020.03.09.20033357v1.full.pdf
+fig.set_size_inches(8, 5)
+np.mean(ifr_list), np.median(ifr_list)
+
+
+
+
+
+plt.hist(attack_list, bins = 30, density=True, histtype='step', linewidth = '2', color='k')#log=True, 
+plt.title("Attack Rate density")
+plt.xlabel('Proportion of population infected', fontsize=12)
+
+fig = plt.gcf()
+
+fig.set_size_inches(8, 5)
+np.mean(attack_list), np.median(attack_list)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
